@@ -1,0 +1,21 @@
+[package]
+name = "yaorust"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Fast minimal AUR + repo helper with root-safe build modes"
+readme = "README.md"
+repository = "https://github.com/darko5r/yaorust"
+
+[dependencies]
+# clap/reqwest/serde/which/tempfile/etc...
+
+[profile.release]
+opt-level = 3
+lto = "fat" 
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+debug-assertions = false
+overflow-checks = false
+incremental = false
