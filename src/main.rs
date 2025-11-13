@@ -55,7 +55,10 @@ enum RootMode {
 
 impl RootMode {
     fn from_env() -> Self {
-        match env::var("YAORUST_ROOT_MODE").unwrap_or_else(|_| "auto".into()).as_str() {
+        match env::var("YAORUST_ROOT_MODE")
+            .unwrap_or_else(|_| "auto".into())
+            .as_str()
+        {
             "sandbox" => RootMode::Sandbox,
             "user" => RootMode::User,
             "trust-root" => RootMode::TrustRoot,
@@ -121,8 +124,8 @@ impl Config {
 #[derive(Deserialize, Debug)]
 struct AurInfoResponse {
     #[serde(rename = "type")]
-    ty: String,
-    version: i32,
+    _ty: String, // underscore: we deserialize but don't use directly
+    _version: i32,
     resultcount: i32,
     results: Option<Vec<AurPkg>>,
 }
@@ -146,6 +149,15 @@ fn main() -> Result<()> {
     // Create caches/dirs up-front
     fs::create_dir_all(&cfg.pkgdest)?;
     fs::create_dir_all(&cfg.snapshot_cache)?;
+
+    if cfg.verbose {
+        eprintln!(
+            "==> config: PKGDEST={}, snapshot_cache={}, pacman={}, sudo={}, root_mode={:?}, auto_trust_root={}, build_user={}, euid={}",
+            cfg.pkgdest.display(),
+            cfg.snapshot_cache.display(),
+            cfg.pacman, cfg.sudo, cfg.root_mode, cfg.auto_trust_root, cfg.build_user, nix_like_geteuid()
+        );
+    }
 
     match cli.cmd {
         CommandKind::G { pkgs } => cmd_getpkgbuild(&cfg, pkgs),
@@ -260,7 +272,11 @@ fn aur_exists(client: &Client, name: &str) -> Result<bool> {
         bail!("AUR RPC returned {}", resp.status());
     }
     let info: AurInfoResponse = resp.json()?;
-    Ok(info.resultcount > 0 && info.results.as_ref().map_or(false, |v| v.iter().any(|x| x.name == name)))
+    Ok(info.resultcount > 0
+        && info
+            .results
+            .as_ref()
+            .map_or(false, |v| v.iter().any(|x| x.name == name)))
 }
 
 fn download_snapshot(client: &Client, cfg: &Config, name: &str) -> Result<PathBuf> {
@@ -275,7 +291,9 @@ fn download_snapshot(client: &Client, cfg: &Config, name: &str) -> Result<PathBu
     }
 
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::with_template("{spinner} downloading {msg}")?.tick_chars("/|\\- "));
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} downloading {msg}")?.tick_chars("/|\\- "),
+    );
     pb.set_message(name.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
@@ -331,9 +349,11 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
                 let _ = fs::remove_file(file);
             }
             // also remove possible artifacts in CWD of build_dir (same basename)
-            let local = build_dir.join(Path::new(t).file_name().unwrap());
-            if local.exists() {
-                let _ = fs::remove_file(local);
+            if let Some(base) = Path::new(t).file_name() {
+                let local = build_dir.join(base);
+                if local.exists() {
+                    let _ = fs::remove_file(local);
+                }
             }
         }
     }
@@ -362,9 +382,11 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
     for t in &targets {
         let target = Path::new(t);
         if !target.exists() {
-            let local = build_dir.join(target.file_name().unwrap());
-            if local.exists() {
-                fs::rename(&local, &target)?;
+            if let Some(base) = target.file_name() {
+                let local = build_dir.join(base);
+                if local.exists() {
+                    fs::rename(&local, &target)?;
+                }
             }
         }
     }
@@ -428,12 +450,10 @@ fn nix_like_geteuid() -> u32 {
     1 // not root on non-unix targets
 }
 
-fn with_sudo(cfg: &Config, mut cmd: Command) -> Command {
+fn with_sudo(cfg: &Config, cmd: Command) -> Command {
+    // Build a new `sudo ...` command that runs the original program + args
     let prog = cmd.get_program().to_os_string();
-    let args: Vec<_> = cmd
-        .get_args()
-        .map(|s| s.to_os_string())
-        .collect();
+    let args: Vec<_> = cmd.get_args().map(|s| s.to_os_string()).collect();
 
     let mut sc = Command::new(&cfg.sudo);
     sc.arg(prog);
@@ -450,15 +470,16 @@ fn run_command_printing(cmd: &mut Command, verbose: bool) -> Result<()> {
     // simple tee: forward both stdout/stderr
     let mut out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
-    let mut stdout = io::stdout();
-    let mut stderr = io::stderr();
-
-    let t1 = std::thread::spawn(move || io::copy(&mut out, &mut stdout).ok());
-    let t2 = std::thread::spawn(move || io::copy(&mut err, &mut stderr).ok());
+    let t1 = std::thread::spawn(move || io::copy(&mut out, &mut io::stdout()).ok());
+    let t2 = std::thread::spawn(move || io::copy(&mut err, &mut io::stderr()).ok());
 
     let status = child.wait()?;
     let _ = t1.join();
     let _ = t2.join();
+
+    // make sure we actually use `Write` by flushing explicitly
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
 
     if !status.success() {
         bail!("command failed with status {status}");
@@ -478,7 +499,9 @@ fn pretty_cmd(cmd: &Command) -> String {
 
 fn shell_escape<S: AsRef<OsStr>>(s: S) -> String {
     let s = s.as_ref().to_string_lossy();
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c)) {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c))
+    {
         s.into_owned()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
