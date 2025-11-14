@@ -124,10 +124,12 @@ impl Config {
 #[derive(Deserialize, Debug)]
 struct AurInfoResponse {
     #[serde(rename = "type")]
-    _ty: String, // underscore: we deserialize but don't use directly
-    _version: i32,
+    ty: String,
+    #[serde(default)]
+    version: Option<i32>,
     resultcount: i32,
-    results: Option<Vec<AurPkg>>,
+    #[serde(default)]
+    results: Vec<AurPkg>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -272,11 +274,7 @@ fn aur_exists(client: &Client, name: &str) -> Result<bool> {
         bail!("AUR RPC returned {}", resp.status());
     }
     let info: AurInfoResponse = resp.json()?;
-    Ok(info.resultcount > 0
-        && info
-            .results
-            .as_ref()
-            .map_or(false, |v| v.iter().any(|x| x.name == name)))
+    Ok(info.resultcount > 0 && info.results.iter().any(|x| x.name == name))
 }
 
 fn download_snapshot(client: &Client, cfg: &Config, name: &str) -> Result<PathBuf> {
