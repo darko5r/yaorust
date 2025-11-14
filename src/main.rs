@@ -220,11 +220,29 @@ fn cmd_sync(cfg: &Config, pkgs: Vec<String>, force: bool) -> Result<()> {
     let mut repo_pkgs: Vec<String> = Vec::new();
     let mut aur_pkgs: Vec<String> = Vec::new();
 
+    // Also record installed status so we can print a warning like pacman
+    struct PlanItem {
+        name: String,
+        kind: PkgKind,
+        installed: bool,
+    }
+
+    let mut plan: Vec<PlanItem> = Vec::new();
+
     for p in &pkgs {
-        match classify_pkg(cfg, &client, p)? {
+        let kind = classify_pkg(cfg, &client, p)?;
+        let installed = pacman_is_installed(&cfg.pacman, p);
+
+        match kind {
             PkgKind::Repo => repo_pkgs.push(p.clone()),
             PkgKind::Aur => aur_pkgs.push(p.clone()),
         }
+
+        plan.push(PlanItem {
+            name: p.clone(),
+            kind,
+            installed,
+        });
     }
 
     if repo_pkgs.is_empty() && aur_pkgs.is_empty() {
@@ -237,16 +255,21 @@ fn cmd_sync(cfg: &Config, pkgs: Vec<String>, force: bool) -> Result<()> {
         return pacman_install_repo(cfg, &repo_pkgs);
     }
 
-    // AUR present (maybe mixed with repo): show a simple plan, ask once,
-    // then let pacman show its own full prompt later.
+    // AUR present (maybe mixed with repo): show a simple plan, including
+    // "warning: foo is up to date -- reinstalling" when already installed.
     eprintln!(":: Packages to process:");
-    if !repo_pkgs.is_empty() {
-        for p in &repo_pkgs {
-            eprintln!("   {p} (repo)");
+    for item in &plan {
+        let source = match item.kind {
+            PkgKind::Repo => "repo",
+            PkgKind::Aur => "AUR",
+        };
+        eprintln!("   {} ({})", item.name, source);
+        if item.installed {
+            eprintln!(
+                "      warning: {} is up to date -- reinstalling",
+                item.name
+            );
         }
-    }
-    for p in &aur_pkgs {
-        eprintln!("   {p} (AUR)");
     }
 
     if !prompt_yes_no(":: Proceed with installation? [Y/n] ")? {
@@ -294,6 +317,18 @@ fn pacman_si_ok(pacman: &str, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn pacman_is_installed(pacman: &str, name: &str) -> bool {
+    Command::new(pacman)
+        .arg("-Qi")
+        .arg("--")
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Call pacman -S for repo packages, let pacman show all info + its own [Y/n] prompt.
 fn pacman_install_repo(cfg: &Config, pkgs: &[String]) -> Result<()> {
     let mut cmd = Command::new(&cfg.pacman);
@@ -305,7 +340,8 @@ fn pacman_install_repo(cfg: &Config, pkgs: &[String]) -> Result<()> {
         cmd = with_sudo(cfg, cmd);
     }
 
-    run_command_printing(&mut cmd, cfg.verbose)
+    // NEW: treat "n" -> exit code 1 as "Aborted by user."
+    run_command_printing_abort_ok(&mut cmd, cfg.verbose)
 }
 
 /* ---------------------- AUR path ---------------------- */
@@ -324,7 +360,11 @@ fn aur_exists(client: &Client, name: &str) -> Result<bool> {
         bail!("AUR RPC returned {}", resp.status());
     }
     let info: AurInfoResponse = resp.json()?;
-    Ok(info.resultcount > 0 && info.results.as_ref().map_or(false, |v| v.iter().any(|x| x.name == name)))
+    Ok(info.resultcount > 0
+        && info
+            .results
+            .as_ref()
+            .map_or(false, |v| v.iter().any(|x| x.name == name)))
 }
 
 fn download_snapshot(client: &Client, cfg: &Config, name: &str) -> Result<PathBuf> {
@@ -387,7 +427,7 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         bail!("packagelist is empty for {name}");
     }
 
-    // 3) Force handling
+    // 3) Force handling (remove previous artifacts when -f)
     if force {
         for t in &targets {
             let file = Path::new(t);
@@ -408,36 +448,46 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         }
     }
 
-    // 4) Build with makepkg (as current EUID; root-safe modes come later)
-    let mut mk = Command::new(which("makepkg")?);
-    mk.current_dir(&build_dir)
-        .env("PKGDEST", &cfg.pkgdest)
-        .arg("--clean")
-        .arg("--cleanbuild")
-        .arg("--syncdeps")
-        .arg("--needed")
-        .arg("--log")
-        .arg("--config")
-        .arg("/etc/makepkg.conf");
-
-    if force {
-        mk.arg("-f").arg("-C");
-    }
-
-    eprintln!("==> Building {name} (makepkg)...");
-    run_command_printing(&mut mk, cfg.verbose)?;
-
-    // 5) Ensure artifacts exist (some PKGBUILDs might drop in CWD → move to PKGDEST)
-    for t in &targets {
-        let target = Path::new(t);
-        if !target.exists() {
-            let local = build_dir.join(
-                target
-                    .file_name()
-                    .expect("package filename should exist"),
+    // NEW: if all target files already exist and NOT forcing, skip rebuild
+    let all_exist = targets.iter().all(|t| Path::new(t).exists());
+    if !force && all_exist {
+        if cfg.verbose {
+            eprintln!(
+                "==> Using existing package file(s) for {name}, skipping rebuild"
             );
-            if local.exists() {
-                fs::rename(&local, &target)?;
+        }
+    } else {
+        // 4) Build with makepkg (as current EUID; root-safe modes come later)
+        let mut mk = Command::new(which("makepkg")?);
+        mk.current_dir(&build_dir)
+            .env("PKGDEST", &cfg.pkgdest)
+            .arg("--clean")
+            .arg("--cleanbuild")
+            .arg("--syncdeps")
+            .arg("--needed")
+            .arg("--log")
+            .arg("--config")
+            .arg("/etc/makepkg.conf");
+
+        if force {
+            mk.arg("-f").arg("-C");
+        }
+
+        eprintln!("==> Building {name} (makepkg)...");
+        run_command_printing(&mut mk, cfg.verbose)?;
+
+        // 5) Ensure artifacts exist (some PKGBUILDs might drop in CWD → move to PKGDEST)
+        for t in &targets {
+            let target = Path::new(t);
+            if !target.exists() {
+                let local = build_dir.join(
+                    target
+                        .file_name()
+                        .expect("package filename should exist"),
+                );
+                if local.exists() {
+                    fs::rename(&local, &target)?;
+                }
             }
         }
     }
@@ -451,7 +501,8 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
     }
 
     eprintln!("==> Installing {}", name);
-    run_command_printing(&mut pac, cfg.verbose)
+    // use the same "Aborted by user" logic here when user presses 'n'
+    run_command_printing_abort_ok(&mut pac, cfg.verbose)
 }
 
 fn packagelist(build_dir: &Path, pkgdest: &Path) -> Result<Vec<String>> {
@@ -526,6 +577,7 @@ fn with_sudo(cfg: &Config, cmd: Command) -> Command {
     sc
 }
 
+/// Generic runner: any non-zero status is treated as an error.
 fn run_command_printing(cmd: &mut Command, verbose: bool) -> Result<()> {
     if verbose {
         eprintln!("$ {}", pretty_cmd(cmd));
@@ -552,6 +604,42 @@ fn run_command_printing(cmd: &mut Command, verbose: bool) -> Result<()> {
     let _ = t2.join();
 
     if !status.success() {
+        bail!("command failed with status {status}");
+    }
+    Ok(())
+}
+
+/// Variant used for pacman calls: exit code 1 is treated as "Aborted by user."
+fn run_command_printing_abort_ok(cmd: &mut Command, verbose: bool) -> Result<()> {
+    if verbose {
+        eprintln!("$ {}", pretty_cmd(cmd));
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+
+    let t1 = std::thread::spawn(move || {
+        io::copy(&mut out, &mut stdout).ok();
+    });
+    let t2 = std::thread::spawn(move || {
+        io::copy(&mut err, &mut stderr).ok();
+    });
+
+    let status = child.wait()?;
+    let _ = t1.join();
+    let _ = t2.join();
+
+    if !status.success() {
+        if let Some(1) = status.code() {
+            eprintln!(":: Aborted by user.");
+            return Ok(());
+        }
         bail!("command failed with status {status}");
     }
     Ok(())
