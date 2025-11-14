@@ -1,12 +1,11 @@
 use anyhow::{bail, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -14,34 +13,32 @@ use which::which;
 
 const AUR_RPC: &str = "https://aur.archlinux.org/rpc/?v=5";
 
-/// Top-level CLI
+/// yaourt/pacman-style flags:
+///   -S : sync/install
+///   -G : get PKGBUILD
+///   -f : force rebuild
+///   -v : verbose
 #[derive(Parser, Debug)]
-#[command(name = "yaorust", version, about = "Fast minimal AUR + repo helper")]
+#[command(name = "yao", version, about = "Fast minimal AUR + repo helper")]
 struct Cli {
+    /// Sync/Install (like pacman -S)
+    #[arg(short = 'S', long = "sync", action = ArgAction::SetTrue, conflicts_with = "get")]
+    sync: bool,
+
+    /// Get PKGBUILD snapshot(s) to ./<pkg>/ (like yaourt -G)
+    #[arg(short = 'G', long = "get", action = ArgAction::SetTrue, conflicts_with = "sync")]
+    get: bool,
+
+    /// Force rebuild/overwrite (for -S)
+    #[arg(short = 'f', long = "force", action = ArgAction::SetTrue)]
+    force: bool,
+
     /// Verbose logging
-    #[arg(short, long, action = ArgAction::SetTrue)]
+    #[arg(short = 'v', long = "verbose", action = ArgAction::SetTrue)]
     verbose: bool,
 
-    #[command(subcommand)]
-    cmd: CommandKind,
-}
-
-#[derive(Subcommand, Debug)]
-enum CommandKind {
-    /// Install from repos or AUR
-    S {
-        /// Force rebuild/overwrite
-        #[arg(short = 'f', long, action = ArgAction::SetTrue)]
-        force: bool,
-
-        /// Packages to install
-        pkgs: Vec<String>,
-    },
-    /// Download PKGBUILD(s) to ./<pkg>/
-    G {
-        /// Packages to fetch
-        pkgs: Vec<String>,
-    },
+    /// Packages (positional)
+    pkgs: Vec<String>,
 }
 
 /// Root-mode behavior (placeholder for coming features)
@@ -55,10 +52,7 @@ enum RootMode {
 
 impl RootMode {
     fn from_env() -> Self {
-        match env::var("YAORUST_ROOT_MODE")
-            .unwrap_or_else(|_| "auto".into())
-            .as_str()
-        {
+        match env::var("YAORUST_ROOT_MODE").unwrap_or_else(|_| "auto".into()).as_str() {
             "sandbox" => RootMode::Sandbox,
             "user" => RootMode::User,
             "trust-root" => RootMode::TrustRoot,
@@ -72,11 +66,11 @@ impl RootMode {
 struct Config {
     /// Where makepkg will place built packages
     pkgdest: PathBuf,
-    /// How to behave when running as root
+    /// How to behave when running as root (future)
     root_mode: RootMode,
-    /// Auto-enable patched makepkg for root mode (later)
+    /// Auto-enable patched makepkg for root mode (future)
     auto_trust_root: bool,
-    /// Build user for "user" mode fallback (later)
+    /// Build user for "user" mode fallback (future)
     build_user: String,
     /// Snapshot cache dir for AUR tarballs
     snapshot_cache: PathBuf,
@@ -128,8 +122,7 @@ struct AurInfoResponse {
     #[serde(default)]
     version: Option<i32>,
     resultcount: i32,
-    #[serde(default)]
-    results: Vec<AurPkg>,
+    results: Option<Vec<AurPkg>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -143,6 +136,15 @@ struct AurPkg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Require either -S or -G
+    if !cli.sync && !cli.get {
+        eprintln!("error: one of -S or -G is required\n");
+        Cli::command().print_help()?;
+        eprintln!();
+        std::process::exit(2);
+    }
+
     let cfg = Config::load(cli.verbose)?;
 
     // Ensure required external tools are present
@@ -157,13 +159,19 @@ fn main() -> Result<()> {
             "==> config: PKGDEST={}, snapshot_cache={}, pacman={}, sudo={}, root_mode={:?}, auto_trust_root={}, build_user={}, euid={}",
             cfg.pkgdest.display(),
             cfg.snapshot_cache.display(),
-            cfg.pacman, cfg.sudo, cfg.root_mode, cfg.auto_trust_root, cfg.build_user, nix_like_geteuid()
+            cfg.pacman,
+            cfg.sudo,
+            cfg.root_mode,
+            cfg.auto_trust_root,
+            cfg.build_user,
+            nix_like_geteuid()
         );
     }
 
-    match cli.cmd {
-        CommandKind::G { pkgs } => cmd_getpkgbuild(&cfg, pkgs),
-        CommandKind::S { pkgs, force } => cmd_sync(&cfg, pkgs, force),
+    if cli.get {
+        cmd_getpkgbuild(&cfg, cli.pkgs)
+    } else {
+        cmd_sync(&cfg, cli.pkgs, cli.force)
     }
 }
 
@@ -274,7 +282,7 @@ fn aur_exists(client: &Client, name: &str) -> Result<bool> {
         bail!("AUR RPC returned {}", resp.status());
     }
     let info: AurInfoResponse = resp.json()?;
-    Ok(info.resultcount > 0 && info.results.iter().any(|x| x.name == name))
+    Ok(info.resultcount > 0 && info.results.as_ref().map_or(false, |v| v.iter().any(|x| x.name == name)))
 }
 
 fn download_snapshot(client: &Client, cfg: &Config, name: &str) -> Result<PathBuf> {
@@ -289,9 +297,7 @@ fn download_snapshot(client: &Client, cfg: &Config, name: &str) -> Result<PathBu
     }
 
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner} downloading {msg}")?.tick_chars("/|\\- "),
-    );
+    pb.set_style(ProgressStyle::with_template("{spinner} downloading {msg}")?.tick_chars("/|\\- "));
     pb.set_message(name.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
@@ -336,22 +342,19 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         bail!("packagelist is empty for {name}");
     }
 
-    // 3) Force handling
+    // 3) Force handling: remove old target files in PKGDEST and local build dir
     if force {
         for t in &targets {
             let file = Path::new(t);
-            if file.exists() {
-                if cfg.verbose {
-                    eprintln!("==> removing {}", file.display());
-                }
-                let _ = fs::remove_file(file);
+            if file.exists() && cfg.verbose {
+                eprintln!("==> removing {}", file.display());
             }
-            // also remove possible artifacts in CWD of build_dir (same basename)
-            if let Some(base) = Path::new(t).file_name() {
+            let _ = fs::remove_file(file);
+
+            // Also remove possible artifacts in CWD of build_dir (same basename)
+            if let Some(base) = file.file_name() {
                 let local = build_dir.join(base);
-                if local.exists() {
-                    let _ = fs::remove_file(local);
-                }
+                let _ = fs::remove_file(local);
             }
         }
     }
@@ -449,7 +452,7 @@ fn nix_like_geteuid() -> u32 {
 }
 
 fn with_sudo(cfg: &Config, cmd: Command) -> Command {
-    // Build a new `sudo ...` command that runs the original program + args
+    // wrap the given command with sudo <prog> <args...>
     let prog = cmd.get_program().to_os_string();
     let args: Vec<_> = cmd.get_args().map(|s| s.to_os_string()).collect();
 
@@ -475,12 +478,8 @@ fn run_command_printing(cmd: &mut Command, verbose: bool) -> Result<()> {
     let _ = t1.join();
     let _ = t2.join();
 
-    // make sure we actually use `Write` by flushing explicitly
-    let _ = io::stdout().flush();
-    let _ = io::stderr().flush();
-
     if !status.success() {
-        bail!("command failed with status {status}");
+        bail!("command failed with status {}", status);
     }
     Ok(())
 }
@@ -489,18 +488,16 @@ fn pretty_cmd(cmd: &Command) -> String {
     let prog = cmd.get_program().to_string_lossy().to_string();
     let args = cmd
         .get_args()
-        .map(|a| shell_escape(a))
+        .map(|a| shell_escape(a.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(" ");
     format!("{prog} {args}")
 }
 
-fn shell_escape<S: AsRef<OsStr>>(s: S) -> String {
-    let s = s.as_ref().to_string_lossy();
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c))
-    {
-        s.into_owned()
+fn shell_escape<S: AsRef<str>>(s: S) -> String {
+    let s = s.as_ref();
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c)) {
+        s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
