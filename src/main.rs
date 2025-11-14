@@ -1,9 +1,10 @@
 use anyhow::{bail, Result};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,35 +14,37 @@ use which::which;
 
 const AUR_RPC: &str = "https://aur.archlinux.org/rpc/?v=5";
 
-/// yaourt/pacman-style flags:
-///   -S : sync/install
-///   -G : get PKGBUILD
-///   -f : force rebuild
-///   -v : verbose
+/* ---------------------- CLI: pacman/yaourt style ---------------------- */
+
 #[derive(Parser, Debug)]
-#[command(name = "yao", version, about = "Fast minimal AUR + repo helper")]
+#[command(
+    name = "yao",
+    version,
+    about = "Fast minimal AUR + repo helper (yaourt-style flags)"
+)]
 struct Cli {
-    /// Sync/Install (like pacman -S)
-    #[arg(short = 'S', long = "sync", action = ArgAction::SetTrue, conflicts_with = "get")]
+    /// Sync/install (repo or AUR), like pacman -S
+    #[arg(short = 'S', action = ArgAction::SetTrue, conflicts_with = "getpkgbuild")]
     sync: bool,
 
-    /// Get PKGBUILD snapshot(s) to ./<pkg>/ (like yaourt -G)
-    #[arg(short = 'G', long = "get", action = ArgAction::SetTrue, conflicts_with = "sync")]
-    get: bool,
+    /// Get PKGBUILD snapshot(s) into ./<pkg>/, like yaourt -G
+    #[arg(short = 'G', action = ArgAction::SetTrue, conflicts_with = "sync")]
+    getpkgbuild: bool,
 
-    /// Force rebuild/overwrite (for -S)
-    #[arg(short = 'f', long = "force", action = ArgAction::SetTrue)]
+    /// Force rebuild/overwrite existing packages (passed to makepkg)
+    #[arg(short = 'f', long, action = ArgAction::SetTrue)]
     force: bool,
 
-    /// Verbose logging
-    #[arg(short = 'v', long = "verbose", action = ArgAction::SetTrue)]
+    /// Verbose logging (print executed commands & config)
+    #[arg(short = 'v', long, action = ArgAction::SetTrue)]
     verbose: bool,
 
-    /// Packages (positional)
+    /// Package names (for -S or -G)
     pkgs: Vec<String>,
 }
 
-/// Root-mode behavior (placeholder for coming features)
+/* ---------------------- Root-mode enum (future use) ---------------------- */
+
 #[derive(Clone, Copy, Debug)]
 enum RootMode {
     Auto,
@@ -61,24 +64,17 @@ impl RootMode {
     }
 }
 
-/// Runtime configuration collected from ENV (and defaults)
+/* ---------------------- Runtime config ---------------------- */
+
 #[derive(Clone, Debug)]
 struct Config {
-    /// Where makepkg will place built packages
     pkgdest: PathBuf,
-    /// How to behave when running as root (future)
     root_mode: RootMode,
-    /// Auto-enable patched makepkg for root mode (future)
     auto_trust_root: bool,
-    /// Build user for "user" mode fallback (future)
     build_user: String,
-    /// Snapshot cache dir for AUR tarballs
     snapshot_cache: PathBuf,
-    /// Pacman binary name/path
     pacman: String,
-    /// Sudo binary name/path
     sudo: String,
-    /// Whether to print extra logs
     verbose: bool,
 }
 
@@ -129,7 +125,7 @@ struct AurInfoResponse {
 struct AurPkg {
     #[serde(rename = "Name")]
     name: String,
-    // other fields not needed now
+    // (We ignore the rest for now)
 }
 
 /* ---------------------- Entry ---------------------- */
@@ -137,20 +133,15 @@ struct AurPkg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Require either -S or -G
-    if !cli.sync && !cli.get {
-        eprintln!("error: one of -S or -G is required\n");
+    // If neither -S nor -G were provided, show help (pacman-like UX)
+    if !cli.sync && !cli.getpkgbuild {
         Cli::command().print_help()?;
         eprintln!();
-        std::process::exit(2);
+        return Ok(());
     }
 
     let cfg = Config::load(cli.verbose)?;
-
-    // Ensure required external tools are present
     ensure_tools(&cfg)?;
-
-    // Create caches/dirs up-front
     fs::create_dir_all(&cfg.pkgdest)?;
     fs::create_dir_all(&cfg.snapshot_cache)?;
 
@@ -168,7 +159,7 @@ fn main() -> Result<()> {
         );
     }
 
-    if cli.get {
+    if cli.getpkgbuild {
         cmd_getpkgbuild(&cfg, cli.pkgs)
     } else {
         cmd_sync(&cfg, cli.pkgs, cli.force)
@@ -206,20 +197,46 @@ fn cmd_sync(cfg: &Config, pkgs: Vec<String>, force: bool) -> Result<()> {
     if pkgs.is_empty() {
         bail!("no packages specified for -S");
     }
+
     let client = http_client()?;
 
-    for p in pkgs {
-        match classify_pkg(cfg, &client, &p)? {
+    // 1) Build a plan: (name, kind)
+    let mut plan: Vec<(String, PkgKind)> = Vec::new();
+    for name in pkgs {
+        let kind = classify_pkg(cfg, &client, &name)?;
+        plan.push((name, kind));
+    }
+
+    // 2) Show summary
+    eprintln!(":: Packages to process:");
+    for (name, kind) in &plan {
+        let k = match kind {
+            PkgKind::Repo => "repo",
+            PkgKind::Aur => "AUR",
+        };
+        eprintln!("   {name} ({k})");
+    }
+
+    // 3) Ask for confirmation
+    if !ask_yes_no(":: Proceed with installation?") {
+        eprintln!(":: Aborted by user.");
+        return Ok(());
+    }
+
+    // 4) Execute plan
+    for (name, kind) in plan {
+        match kind {
             PkgKind::Repo => {
-                eprintln!("==> [repo] installing {p}");
-                pacman_install_repo(cfg, &[p])?;
+                eprintln!("==> [repo] installing {name}");
+                pacman_install_repo(cfg, &[name])?;
             }
             PkgKind::Aur => {
-                eprintln!("==> [aur] building {p}");
-                aur_build_install(cfg, &client, &p, force)?;
+                eprintln!("==> [aur] building {name}");
+                aur_build_install(cfg, &client, &name, force)?;
             }
         }
     }
+
     Ok(())
 }
 
@@ -270,7 +287,7 @@ fn pacman_install_repo(cfg: &Config, pkgs: &[String]) -> Result<()> {
 
 fn http_client() -> Result<Client> {
     let client = Client::builder()
-        .user_agent("yaorust/0.1 (+https://github.com/darko5r/yaorust)")
+        .user_agent("yao/0.1 (+https://github.com/darko5r/yaorust)")
         .build()?;
     Ok(client)
 }
@@ -336,30 +353,30 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         bail!("unexpected snapshot layout for {name}");
     }
 
-    // 2) Resolve exact outputs (makepkg --packagelist with PKGDEST)
+    // 2) Resolve outputs (respects PKGDEST)
     let targets = packagelist(&build_dir, &cfg.pkgdest)?;
     if targets.is_empty() {
         bail!("packagelist is empty for {name}");
     }
 
-    // 3) Force handling: remove old target files in PKGDEST and local build dir
+    // 3) Force handling
     if force {
         for t in &targets {
             let file = Path::new(t);
-            if file.exists() && cfg.verbose {
-                eprintln!("==> removing {}", file.display());
+            if file.exists() {
+                if cfg.verbose {
+                    eprintln!("==> removing {}", file.display());
+                }
+                let _ = fs::remove_file(file);
             }
-            let _ = fs::remove_file(file);
-
-            // Also remove possible artifacts in CWD of build_dir (same basename)
-            if let Some(base) = file.file_name() {
-                let local = build_dir.join(base);
+            let local = build_dir.join(Path::new(t).file_name().unwrap());
+            if local.exists() {
                 let _ = fs::remove_file(local);
             }
         }
     }
 
-    // 4) Build (M1: run as current EUID; sandbox comes next milestone)
+    // 4) Build
     let mut mk = Command::new(which("makepkg")?);
     mk.current_dir(&build_dir)
         .env("PKGDEST", &cfg.pkgdest)
@@ -379,22 +396,38 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
     eprintln!("==> Building {name} (makepkg)…");
     run_command_printing(&mut mk, cfg.verbose)?;
 
-    // 5) Ensure artifacts exist (some PKGBUILDs might drop in CWD → move to PKGDEST)
+    // 5) Ensure artifacts exist (move from CWD if needed)
     for t in &targets {
         let target = Path::new(t);
         if !target.exists() {
-            if let Some(base) = target.file_name() {
-                let local = build_dir.join(base);
-                if local.exists() {
-                    fs::rename(&local, &target)?;
-                }
+            let local = build_dir.join(target.file_name().unwrap());
+            if local.exists() {
+                fs::rename(&local, &target)?;
             }
         }
     }
 
-    // 6) Install
+        // 6) Filter to actually existing artifacts (debug packages may be skipped)
+    let existing: Vec<String> = targets
+        .iter()
+        .filter(|t| Path::new(t).exists())
+        .cloned()
+        .collect();
+
+    if existing.is_empty() {
+        bail!("no built package artifacts found for {name} in {}", cfg.pkgdest.display());
+    }
+
+    if cfg.verbose {
+        eprintln!("==> install targets:");
+        for t in &existing {
+            eprintln!("    {}", t);
+        }
+    }
+
+    // 7) Install
     let mut pac = Command::new(&cfg.pacman);
-    pac.arg("-U").arg("--noconfirm").args(&targets);
+    pac.arg("-U").arg("--noconfirm").args(&existing);
 
     if !is_root() {
         pac = with_sudo(cfg, pac);
@@ -424,6 +457,34 @@ fn packagelist(build_dir: &Path, pkgdest: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/* ---------------------- yes/no prompt ---------------------- */
+
+fn ask_yes_no(prompt: &str) -> bool {
+    use std::io::{self, Write};
+
+    let mut input = String::new();
+    loop {
+        eprint!("{prompt} [Y/n] ");
+        let _ = io::stderr().flush();
+
+        input.clear();
+        if io::stdin().read_line(&mut input).is_err() {
+            // On IO error, be conservative: treat as "no"
+            return false;
+        }
+
+        let t = input.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("y") || t.eq_ignore_ascii_case("yes") {
+            return true;
+        }
+        if t.eq_ignore_ascii_case("n") || t.eq_ignore_ascii_case("no") {
+            return false;
+        }
+
+        eprintln!("Please answer y or n.");
+    }
+}
+
 /* ---------------------- Utilities ---------------------- */
 
 fn ensure_tools(cfg: &Config) -> Result<()> {
@@ -442,17 +503,16 @@ fn is_root() -> bool {
 
 #[cfg(target_family = "unix")]
 fn nix_like_geteuid() -> u32 {
-    // small dependency-free geteuid
     unsafe { libc::geteuid() }
 }
 
 #[cfg(not(target_family = "unix"))]
 fn nix_like_geteuid() -> u32 {
-    1 // not root on non-unix targets
+    1
 }
 
 fn with_sudo(cfg: &Config, cmd: Command) -> Command {
-    // wrap the given command with sudo <prog> <args...>
+    // Rebuild cmd as: sudo <prog> <args...>
     let prog = cmd.get_program().to_os_string();
     let args: Vec<_> = cmd.get_args().map(|s| s.to_os_string()).collect();
 
@@ -468,7 +528,6 @@ fn run_command_printing(cmd: &mut Command, verbose: bool) -> Result<()> {
     }
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
-    // simple tee: forward both stdout/stderr
     let mut out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
     let t1 = std::thread::spawn(move || io::copy(&mut out, &mut io::stdout()).ok());
@@ -479,7 +538,7 @@ fn run_command_printing(cmd: &mut Command, verbose: bool) -> Result<()> {
     let _ = t2.join();
 
     if !status.success() {
-        bail!("command failed with status {}", status);
+        bail!("command failed with status {status}");
     }
     Ok(())
 }
@@ -488,16 +547,18 @@ fn pretty_cmd(cmd: &Command) -> String {
     let prog = cmd.get_program().to_string_lossy().to_string();
     let args = cmd
         .get_args()
-        .map(|a| shell_escape(a.to_string_lossy()))
+        .map(|a| shell_escape(a))
         .collect::<Vec<_>>()
         .join(" ");
     format!("{prog} {args}")
 }
 
-fn shell_escape<S: AsRef<str>>(s: S) -> String {
-    let s = s.as_ref();
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c)) {
-        s.to_string()
+fn shell_escape<S: AsRef<OsStr>>(s: S) -> String {
+    let s = s.as_ref().to_string_lossy();
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c))
+    {
+        s.into_owned()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
