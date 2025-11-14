@@ -1,12 +1,12 @@
 use anyhow::{bail, Result};
-use clap::{ArgAction, CommandFactory, Parser};
+use clap::{ArgAction, Parser};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -14,8 +14,7 @@ use which::which;
 
 const AUR_RPC: &str = "https://aur.archlinux.org/rpc/?v=5";
 
-/* ---------------------- CLI: pacman/yaourt style ---------------------- */
-
+/// yaourt-style front-end: `yao -S foo`, `yao -G foo`
 #[derive(Parser, Debug)]
 #[command(
     name = "yao",
@@ -24,27 +23,26 @@ const AUR_RPC: &str = "https://aur.archlinux.org/rpc/?v=5";
 )]
 struct Cli {
     /// Sync/install (repo or AUR), like pacman -S
-    #[arg(short = 'S', action = ArgAction::SetTrue, conflicts_with = "getpkgbuild")]
+    #[arg(short = 'S', action = ArgAction::SetTrue)]
     sync: bool,
 
     /// Get PKGBUILD snapshot(s) into ./<pkg>/, like yaourt -G
-    #[arg(short = 'G', action = ArgAction::SetTrue, conflicts_with = "sync")]
-    getpkgbuild: bool,
+    #[arg(short = 'G', action = ArgAction::SetTrue)]
+    get: bool,
 
-    /// Force rebuild/overwrite existing packages (passed to makepkg)
+    /// Force rebuild/overwrite (passed to makepkg)
     #[arg(short = 'f', long, action = ArgAction::SetTrue)]
     force: bool,
 
     /// Verbose logging (print executed commands & config)
-    #[arg(short = 'v', long, action = ArgAction::SetTrue)]
+    #[arg(short, long, action = ArgAction::SetTrue)]
     verbose: bool,
 
     /// Package names (for -S or -G)
     pkgs: Vec<String>,
 }
 
-/* ---------------------- Root-mode enum (future use) ---------------------- */
-
+/// Root-mode behavior (future hook for sandbox/user mapping)
 #[derive(Clone, Copy, Debug)]
 enum RootMode {
     Auto,
@@ -55,7 +53,10 @@ enum RootMode {
 
 impl RootMode {
     fn from_env() -> Self {
-        match env::var("YAORUST_ROOT_MODE").unwrap_or_else(|_| "auto".into()).as_str() {
+        match env::var("YAORUST_ROOT_MODE")
+            .unwrap_or_else(|_| "auto".into())
+            .as_str()
+        {
             "sandbox" => RootMode::Sandbox,
             "user" => RootMode::User,
             "trust-root" => RootMode::TrustRoot,
@@ -64,17 +65,24 @@ impl RootMode {
     }
 }
 
-/* ---------------------- Runtime config ---------------------- */
-
+/// Runtime config from env + defaults
 #[derive(Clone, Debug)]
 struct Config {
+    /// Where makepkg will place built packages
     pkgdest: PathBuf,
+    /// How to behave when running as root (future)
     root_mode: RootMode,
+    /// Auto-enable patched makepkg for root mode (future)
     auto_trust_root: bool,
+    /// Build user for "user" mode (future)
     build_user: String,
+    /// Snapshot cache dir for AUR tarballs
     snapshot_cache: PathBuf,
+    /// Pacman binary name/path
     pacman: String,
+    /// Sudo binary name/path
     sudo: String,
+    /// Verbose logging
     verbose: bool,
 }
 
@@ -125,7 +133,15 @@ struct AurInfoResponse {
 struct AurPkg {
     #[serde(rename = "Name")]
     name: String,
-    // (We ignore the rest for now)
+    // other fields not needed yet
+}
+
+/* ---------------------- Package kind ---------------------- */
+
+#[derive(Debug, Clone, Copy)]
+enum PkgKind {
+    Repo,
+    Aur,
 }
 
 /* ---------------------- Entry ---------------------- */
@@ -133,15 +149,16 @@ struct AurPkg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // If neither -S nor -G were provided, show help (pacman-like UX)
-    if !cli.sync && !cli.getpkgbuild {
-        Cli::command().print_help()?;
-        eprintln!();
-        return Ok(());
+    if !cli.sync && !cli.get {
+        bail!("you must specify either -S (sync) or -G (get PKGBUILD)");
     }
 
     let cfg = Config::load(cli.verbose)?;
+
+    // Ensure required external tools
     ensure_tools(&cfg)?;
+
+    // Create caches/dirs up-front
     fs::create_dir_all(&cfg.pkgdest)?;
     fs::create_dir_all(&cfg.snapshot_cache)?;
 
@@ -159,7 +176,7 @@ fn main() -> Result<()> {
         );
     }
 
-    if cli.getpkgbuild {
+    if cli.get {
         cmd_getpkgbuild(&cfg, cli.pkgs)
     } else {
         cmd_sync(&cfg, cli.pkgs, cli.force)
@@ -200,53 +217,58 @@ fn cmd_sync(cfg: &Config, pkgs: Vec<String>, force: bool) -> Result<()> {
 
     let client = http_client()?;
 
-    // 1) Build a plan: (name, kind)
-    let mut plan: Vec<(String, PkgKind)> = Vec::new();
-    for name in pkgs {
-        let kind = classify_pkg(cfg, &client, &name)?;
-        plan.push((name, kind));
+    let mut repo_pkgs: Vec<String> = Vec::new();
+    let mut aur_pkgs: Vec<String> = Vec::new();
+
+    for p in &pkgs {
+        match classify_pkg(cfg, &client, p)? {
+            PkgKind::Repo => repo_pkgs.push(p.clone()),
+            PkgKind::Aur => aur_pkgs.push(p.clone()),
+        }
     }
 
-    // 2) Show summary
+    if repo_pkgs.is_empty() && aur_pkgs.is_empty() {
+        bail!("no packages found in repos or AUR");
+    }
+
+    // PURE REPO: delegate fully to pacman -S
+    if aur_pkgs.is_empty() {
+        eprintln!("==> [repo] delegating to pacman -S");
+        return pacman_install_repo(cfg, &repo_pkgs);
+    }
+
+    // AUR present (maybe mixed with repo): show a simple plan, ask once,
+    // then let pacman show its own full prompt later.
     eprintln!(":: Packages to process:");
-    for (name, kind) in &plan {
-        let k = match kind {
-            PkgKind::Repo => "repo",
-            PkgKind::Aur => "AUR",
-        };
-        eprintln!("   {name} ({k})");
+    if !repo_pkgs.is_empty() {
+        for p in &repo_pkgs {
+            eprintln!("   {p} (repo)");
+        }
+    }
+    for p in &aur_pkgs {
+        eprintln!("   {p} (AUR)");
     }
 
-    // 3) Ask for confirmation
-    if !ask_yes_no(":: Proceed with installation?") {
+    if !prompt_yes_no(":: Proceed with installation? [Y/n] ")? {
         eprintln!(":: Aborted by user.");
         return Ok(());
     }
 
-    // 4) Execute plan
-    for (name, kind) in plan {
-        match kind {
-            PkgKind::Repo => {
-                eprintln!("==> [repo] installing {name}");
-                pacman_install_repo(cfg, &[name])?;
-            }
-            PkgKind::Aur => {
-                eprintln!("==> [aur] building {name}");
-                aur_build_install(cfg, &client, &name, force)?;
-            }
-        }
+    // 1) Handle repo pkgs first via pacman -S (full pacman output + prompt)
+    if !repo_pkgs.is_empty() {
+        pacman_install_repo(cfg, &repo_pkgs)?;
+    }
+
+    // 2) Then handle AUR packages one by one
+    for p in aur_pkgs {
+        eprintln!("==> [aur] building {p}");
+        aur_build_install(cfg, &client, &p, force)?;
     }
 
     Ok(())
 }
 
 /* ---------------------- Classify ---------------------- */
-
-#[derive(Debug, Clone, Copy)]
-enum PkgKind {
-    Repo,
-    Aur,
-}
 
 fn classify_pkg(cfg: &Config, client: &Client, name: &str) -> Result<PkgKind> {
     if pacman_si_ok(&cfg.pacman, name) {
@@ -272,9 +294,12 @@ fn pacman_si_ok(pacman: &str, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Call pacman -S for repo packages, let pacman show all info + its own [Y/n] prompt.
 fn pacman_install_repo(cfg: &Config, pkgs: &[String]) -> Result<()> {
     let mut cmd = Command::new(&cfg.pacman);
-    cmd.arg("-S").arg("--needed").args(pkgs);
+    cmd.arg("-S")
+        // no --needed here; behave like plain pacman (allow reinstall)
+        .args(pkgs);
 
     if !is_root() {
         cmd = with_sudo(cfg, cmd);
@@ -287,7 +312,7 @@ fn pacman_install_repo(cfg: &Config, pkgs: &[String]) -> Result<()> {
 
 fn http_client() -> Result<Client> {
     let client = Client::builder()
-        .user_agent("yao/0.1 (+https://github.com/darko5r/yaorust)")
+        .user_agent("yaorust/0.1 (+https://github.com/darko5r/yaorust)")
         .build()?;
     Ok(client)
 }
@@ -314,7 +339,10 @@ fn download_snapshot(client: &Client, cfg: &Config, name: &str) -> Result<PathBu
     }
 
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::with_template("{spinner} downloading {msg}")?.tick_chars("/|\\- "));
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} downloading {msg}")?
+            .tick_chars("/|\\- "),
+    );
     pb.set_message(name.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
@@ -353,7 +381,7 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         bail!("unexpected snapshot layout for {name}");
     }
 
-    // 2) Resolve outputs (respects PKGDEST)
+    // 2) Resolve exact outputs (makepkg --packagelist with PKGDEST)
     let targets = packagelist(&build_dir, &cfg.pkgdest)?;
     if targets.is_empty() {
         bail!("packagelist is empty for {name}");
@@ -369,14 +397,18 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
                 }
                 let _ = fs::remove_file(file);
             }
-            let local = build_dir.join(Path::new(t).file_name().unwrap());
+            let local = build_dir.join(
+                Path::new(t)
+                    .file_name()
+                    .expect("package filename should exist"),
+            );
             if local.exists() {
                 let _ = fs::remove_file(local);
             }
         }
     }
 
-    // 4) Build
+    // 4) Build with makepkg (as current EUID; root-safe modes come later)
     let mut mk = Command::new(which("makepkg")?);
     mk.current_dir(&build_dir)
         .env("PKGDEST", &cfg.pkgdest)
@@ -384,7 +416,6 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         .arg("--cleanbuild")
         .arg("--syncdeps")
         .arg("--needed")
-        .arg("--noconfirm")
         .arg("--log")
         .arg("--config")
         .arg("/etc/makepkg.conf");
@@ -393,68 +424,34 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         mk.arg("-f").arg("-C");
     }
 
-    eprintln!("==> Building {name} (makepkg)…");
+    eprintln!("==> Building {name} (makepkg)...");
     run_command_printing(&mut mk, cfg.verbose)?;
 
-    // 5) Ensure artifacts exist (move from CWD if needed)
-   for t in &targets {
-    let target = Path::new(t);
-    if !target.exists() {
-        let local = build_dir.join(target.file_name().unwrap());
-        if local.exists() {
-            fs::rename(&local, &target)?;
-        }
-    }
-}
-
-// NEW: filter to only existing files
-let mut install_targets = Vec::new();
-for t in &targets {
-    let p = Path::new(t);
-    if p.exists() {
-        install_targets.push(t.clone());
-    } else if cfg.verbose {
-        eprintln!(
-            "==> warning: expected package {} not found, skipping",
-            p.display()
-        );
-    }
-}
-
-if install_targets.is_empty() {
-    bail!("no packages produced for {name}");
-}
-
-        // 6) Filter to actually existing artifacts (debug packages may be skipped)
-    let existing: Vec<String> = targets
-        .iter()
-        .filter(|t| Path::new(t).exists())
-        .cloned()
-        .collect();
-
-    if existing.is_empty() {
-        bail!("no built package artifacts found for {name} in {}", cfg.pkgdest.display());
-    }
-
-    if cfg.verbose {
-        eprintln!("==> install targets:");
-        for t in &existing {
-            eprintln!("    {}", t);
+    // 5) Ensure artifacts exist (some PKGBUILDs might drop in CWD → move to PKGDEST)
+    for t in &targets {
+        let target = Path::new(t);
+        if !target.exists() {
+            let local = build_dir.join(
+                target
+                    .file_name()
+                    .expect("package filename should exist"),
+            );
+            if local.exists() {
+                fs::rename(&local, &target)?;
+            }
         }
     }
 
-    // 7) Install
-   let mut pac = Command::new(&cfg.pacman);
+    // 6) Install via pacman -U (no --noconfirm: let pacman show details + prompt)
+    let mut pac = Command::new(&cfg.pacman);
+    pac.arg("-U").args(&targets);
 
-// no --noconfirm → pacman will prompt like normal
-pac.arg("-U").args(&install_targets);
+    if !is_root() {
+        pac = with_sudo(cfg, pac);
+    }
 
-if !is_root() {
-    pac = with_sudo(cfg, pac);
-}
-
-eprintln!("==> Installing {}", name);
-run_command_printing(&mut pac, cfg.verbose)
+    eprintln!("==> Installing {}", name);
+    run_command_printing(&mut pac, cfg.verbose)
 }
 
 fn packagelist(build_dir: &Path, pkgdest: &Path) -> Result<Vec<String>> {
@@ -475,34 +472,6 @@ fn packagelist(build_dir: &Path, pkgdest: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(out)
-}
-
-/* ---------------------- yes/no prompt ---------------------- */
-
-fn ask_yes_no(prompt: &str) -> bool {
-    use std::io::{self, Write};
-
-    let mut input = String::new();
-    loop {
-        eprint!("{prompt} [Y/n] ");
-        let _ = io::stderr().flush();
-
-        input.clear();
-        if io::stdin().read_line(&mut input).is_err() {
-            // On IO error, be conservative: treat as "no"
-            return false;
-        }
-
-        let t = input.trim();
-        if t.is_empty() || t.eq_ignore_ascii_case("y") || t.eq_ignore_ascii_case("yes") {
-            return true;
-        }
-        if t.eq_ignore_ascii_case("n") || t.eq_ignore_ascii_case("no") {
-            return false;
-        }
-
-        eprintln!("Please answer y or n.");
-    }
 }
 
 /* ---------------------- Utilities ---------------------- */
@@ -531,8 +500,23 @@ fn nix_like_geteuid() -> u32 {
     1
 }
 
+/// Simple [Y/n] prompt on stdin.
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    let mut stdout = io::stdout();
+    write!(stdout, "{prompt}")?;
+    stdout.flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_lowercase();
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn with_sudo(cfg: &Config, cmd: Command) -> Command {
-    // Rebuild cmd as: sudo <prog> <args...>
     let prog = cmd.get_program().to_os_string();
     let args: Vec<_> = cmd.get_args().map(|s| s.to_os_string()).collect();
 
@@ -546,12 +530,22 @@ fn run_command_printing(cmd: &mut Command, verbose: bool) -> Result<()> {
     if verbose {
         eprintln!("$ {}", pretty_cmd(cmd));
     }
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
     let mut out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
-    let t1 = std::thread::spawn(move || io::copy(&mut out, &mut io::stdout()).ok());
-    let t2 = std::thread::spawn(move || io::copy(&mut err, &mut io::stderr()).ok());
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+
+    let t1 = std::thread::spawn(move || {
+        io::copy(&mut out, &mut stdout).ok();
+    });
+    let t2 = std::thread::spawn(move || {
+        io::copy(&mut err, &mut stderr).ok();
+    });
 
     let status = child.wait()?;
     let _ = t1.join();
@@ -575,7 +569,8 @@ fn pretty_cmd(cmd: &Command) -> String {
 
 fn shell_escape<S: AsRef<OsStr>>(s: S) -> String {
     let s = s.as_ref().to_string_lossy();
-    if s.chars()
+    if s
+        .chars()
         .all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c))
     {
         s.into_owned()
