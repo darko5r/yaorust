@@ -397,15 +397,33 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
     run_command_printing(&mut mk, cfg.verbose)?;
 
     // 5) Ensure artifacts exist (move from CWD if needed)
-    for t in &targets {
-        let target = Path::new(t);
-        if !target.exists() {
-            let local = build_dir.join(target.file_name().unwrap());
-            if local.exists() {
-                fs::rename(&local, &target)?;
-            }
+   for t in &targets {
+    let target = Path::new(t);
+    if !target.exists() {
+        let local = build_dir.join(target.file_name().unwrap());
+        if local.exists() {
+            fs::rename(&local, &target)?;
         }
     }
+}
+
+// NEW: filter to only existing files
+let mut install_targets = Vec::new();
+for t in &targets {
+    let p = Path::new(t);
+    if p.exists() {
+        install_targets.push(t.clone());
+    } else if cfg.verbose {
+        eprintln!(
+            "==> warning: expected package {} not found, skipping",
+            p.display()
+        );
+    }
+}
+
+if install_targets.is_empty() {
+    bail!("no packages produced for {name}");
+}
 
         // 6) Filter to actually existing artifacts (debug packages may be skipped)
     let existing: Vec<String> = targets
@@ -426,15 +444,17 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
     }
 
     // 7) Install
-    let mut pac = Command::new(&cfg.pacman);
-    pac.arg("-U").arg("--noconfirm").args(&existing);
+   let mut pac = Command::new(&cfg.pacman);
 
-    if !is_root() {
-        pac = with_sudo(cfg, pac);
-    }
+// no --noconfirm → pacman will prompt like normal
+pac.arg("-U").args(&install_targets);
 
-    eprintln!("==> Installing {}", name);
-    run_command_printing(&mut pac, cfg.verbose)
+if !is_root() {
+    pac = with_sudo(cfg, pac);
+}
+
+eprintln!("==> Installing {}", name);
+run_command_printing(&mut pac, cfg.verbose)
 }
 
 fn packagelist(build_dir: &Path, pkgdest: &Path) -> Result<Vec<String>> {
