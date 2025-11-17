@@ -99,7 +99,8 @@ impl Config {
         let pacman = env::var("YAORUST_PACMAN").unwrap_or_else(|_| "pacman".to_string());
         let sudo = env::var("YAORUST_SUDO").unwrap_or_else(|_| "sudo".to_string());
 
-        let build_user = env::var("YAORUST_BUILD_USER").unwrap_or_else(|_| "nobody".to_string());
+        let build_user =
+            env::var("YAORUST_BUILD_USER").unwrap_or_else(|_| "nobody".to_string());
         let auto_trust_root = env::var("YAORUST_AUTO_TRUST_ROOT")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -340,7 +341,7 @@ fn pacman_install_repo(cfg: &Config, pkgs: &[String]) -> Result<()> {
         cmd = with_sudo(cfg, cmd);
     }
 
-    // treat "n" (exit code 1) as "Aborted by user."
+    // treat "n" -> exit code 1 as "Aborted by user."
     run_command_printing_abort_ok(&mut cmd, cfg.verbose)
 }
 
@@ -421,8 +422,21 @@ fn aur_build_install(cfg: &Config, client: &Client, name: &str, force: bool) -> 
         bail!("unexpected snapshot layout for {name}");
     }
 
-    // NEW: optional PKGBUILD viewer
-    maybe_view_pkgbuild(&build_dir)?;
+    // 1.5) Optional PKGBUILD review/edit
+    let pkgbuild = build_dir.join("PKGBUILD");
+    if pkgbuild.is_file() {
+        if prompt_yes_no(":: View PKGBUILD? [Y/n] ")? {
+            let editor = choose_editor()?;
+            eprintln!("==> Opening PKGBUILD with {}", editor);
+            let status = Command::new(&editor).arg(&pkgbuild).status()?;
+            if !status.success() {
+                eprintln!(":: Aborted by user (editor).");
+                return Ok(());
+            }
+        }
+    } else if cfg.verbose {
+        eprintln!("==> No PKGBUILD found in {}", build_dir.display());
+    }
 
     // 2) Resolve exact outputs (makepkg --packagelist with PKGDEST)
     let targets = packagelist(&build_dir, &cfg.pkgdest)?;
@@ -570,6 +584,41 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     }
 }
 
+/// Pick editor for PKGBUILD:
+/// YAORUST_EDITOR > VISUAL > EDITOR > interactive with default "nano".
+fn choose_editor() -> Result<String> {
+    if let Ok(e) = env::var("YAORUST_EDITOR") {
+        if !e.trim().is_empty() {
+            return Ok(e);
+        }
+    }
+    if let Ok(e) = env::var("VISUAL") {
+        if !e.trim().is_empty() {
+            return Ok(e);
+        }
+    }
+    if let Ok(e) = env::var("EDITOR") {
+        if !e.trim().is_empty() {
+            return Ok(e);
+        }
+    }
+
+    let default = "nano";
+    let mut stdout = io::stdout();
+    write!(stdout, ":: Editor to use for PKGBUILD [{}]: ", default)?;
+    stdout.flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let choice = input.trim();
+    let ed = if choice.is_empty() {
+        default.to_string()
+    } else {
+        choice.to_string()
+    };
+    Ok(ed)
+}
+
 fn with_sudo(cfg: &Config, cmd: Command) -> Command {
     let prog = cmd.get_program().to_os_string();
     let args: Vec<_> = cmd.get_args().map(|s| s.to_os_string()).collect();
@@ -667,32 +716,5 @@ fn shell_escape<S: AsRef<OsStr>>(s: S) -> String {
         s.into_owned()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
-    }
-}
-
-/// Optional "View PKGBUILD? [Y/n]" prompt for AUR builds.
-fn maybe_view_pkgbuild(build_dir: &Path) -> Result<()> {
-    let pkgbuild = build_dir.join("PKGBUILD");
-    if !pkgbuild.is_file() {
-        return Ok(());
-    }
-
-    if !prompt_yes_no(":: View PKGBUILD? [Y/n] ")? {
-        return Ok(());
-    }
-
-    // Use $PAGER if set, otherwise default to "less"
-    let pager = env::var("PAGER").unwrap_or_else(|_| "less".to_string());
-
-    let status = Command::new(&pager).arg(&pkgbuild).status();
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(_) | Err(_) => {
-            // Pager missing or failed: just dump to stderr
-            let contents = fs::read_to_string(&pkgbuild)?;
-            eprintln!("{contents}");
-            Ok(())
-        }
     }
 }
