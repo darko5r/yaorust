@@ -1,3 +1,4 @@
+/// todo next PKGBUILD view after closing
 use anyhow::{bail, Result};
 use clap::{ArgAction, Parser};
 use indicatif::{ProgressBar, ProgressStyle};
